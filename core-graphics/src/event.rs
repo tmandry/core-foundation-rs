@@ -3,7 +3,7 @@ use crate::event_source::CGEventSource;
 use crate::geometry::CGPoint;
 use core_foundation::{
     base::{CFRelease, CFRetain, CFTypeID, TCFType},
-    mach_port::{CFMachPort, CFMachPortRef},
+    mach_port::{CFMachPort, CFMachPortInvalidate, CFMachPortRef},
 };
 use foreign_types::ForeignType;
 use libc::c_void;
@@ -414,7 +414,7 @@ macro_rules! CGEventMaskBit {
 }
 
 pub type CGEventTapProxy = *const c_void;
-pub type CGEventTapCallBackFn<'tap_life> =
+type CGEventTapCallBackFn<'tap_life> =
     Box<dyn Fn(CGEventTapProxy, CGEventType, &CGEvent) -> Option<CGEvent> + 'tap_life>;
 type CGEventTapCallBackInternal = unsafe extern "C" fn(
     proxy: CGEventTapProxy,
@@ -440,7 +440,6 @@ unsafe extern "C" fn cg_event_tap_callback_internal(
 }
 
 /// ```no_run
-///extern crate core_foundation;
 ///use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 ///use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions, CGEventType};
 ///let current = CFRunLoop::get_current();
@@ -456,9 +455,9 @@ unsafe extern "C" fn cg_event_tap_callback_internal(
 /// ) {
 ///     Ok(tap) => unsafe {
 ///         let loop_source = tap
-///             .mach_port
+///             .mach_port()
 ///             .create_runloop_source(0)
-///             .expect("Somethings is bad ");
+///             .expect("Runloop source creation failed");
 ///         current.add_source(&loop_source, kCFRunLoopCommonModes);
 ///         tap.enable();
 ///         CFRunLoop::run_current();
@@ -467,9 +466,8 @@ unsafe extern "C" fn cg_event_tap_callback_internal(
 /// }
 /// ```
 pub struct CGEventTap<'tap_life> {
-    pub mach_port: CFMachPort,
-    pub callback_ref:
-        Box<dyn Fn(CGEventTapProxy, CGEventType, &CGEvent) -> Option<CGEvent> + 'tap_life>,
+    mach_port: CFMachPort,
+    _callback: Box<CGEventTapCallBackFn<'tap_life>>,
 }
 
 impl<'tap_life> CGEventTap<'tap_life> {
@@ -485,7 +483,7 @@ impl<'tap_life> CGEventTap<'tap_life> {
             .fold(CGEventType::Null as CGEventMask, |mask, &etype| {
                 mask | CGEventMaskBit!(etype)
             });
-        let cb = Box::new(Box::new(callback) as CGEventTapCallBackFn);
+        let cb: Box<CGEventTapCallBackFn> = Box::new(Box::new(callback));
         let cbr = Box::into_raw(cb);
         unsafe {
             let event_tap_ref = CGEventTapCreate(
@@ -500,7 +498,7 @@ impl<'tap_life> CGEventTap<'tap_life> {
             if !event_tap_ref.is_null() {
                 Ok(Self {
                     mach_port: (CFMachPort::wrap_under_create_rule(event_tap_ref)),
-                    callback_ref: Box::from_raw(cbr),
+                    _callback: Box::from_raw(cbr),
                 })
             } else {
                 let _ = Box::from_raw(cbr);
@@ -509,8 +507,18 @@ impl<'tap_life> CGEventTap<'tap_life> {
         }
     }
 
+    pub fn mach_port(&self) -> &CFMachPort {
+        &self.mach_port
+    }
+
     pub fn enable(&self) {
         unsafe { CGEventTapEnable(self.mach_port.as_concrete_TypeRef(), true) }
+    }
+}
+
+impl Drop for CGEventTap<'_> {
+    fn drop(&mut self) {
+        unsafe { CFMachPortInvalidate(self.mach_port.as_CFTypeRef() as *mut _) };
     }
 }
 
